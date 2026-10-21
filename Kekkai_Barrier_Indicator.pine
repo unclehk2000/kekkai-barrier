@@ -1,0 +1,670 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Unclehk2000
+//@version=6
+indicator("Kekkai Barrier — Session Walls, Sweeps & Shifts", "Kekkai", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+tz = "America/New_York"
+
+// ── Inputs ──────────────────────────────────────────────
+var g_D = "View"
+themeI  = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = g_D, tooltip = "Auto follows the chart background. Text and the colours left at their default follow it.", display = display.none)
+lblSize = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = g_D, display = display.none)
+txtColI = input.color(#000001, "Text colour", group = g_D, tooltip = "Left at the default it follows the theme; pick any colour to override.", display = display.none)
+dateFmt = input.string("HH:mm MM/dd", "Label date format", group = g_D, display = display.none)
+extMode = input.string("To last candle", "Session wall length", options = ["To last candle", "Until its hunt session ends"], group = g_D, display = display.none)
+maxDays = input.int(5, "Days of session walls / markers to keep", minval = 1, group = g_D, display = display.none)
+ageDays = input.int(5, "Fresh for first N trading days", minval = 1, group = g_D, display = display.none)
+agedCol = input.color(color.gray, "Aged colour", group = g_D, display = display.none)
+
+var g_S = "Sessions (ET)"
+asiaSess = input.session("2000-0000", "Asia (builds London's walls)", group = g_S, display = display.none)
+ldnSess  = input.session("0200-0500", "London (hunts Asia's walls)", group = g_S, display = display.none)
+nySess   = input.session("0930-1100", "NY AM (hunts London's walls)", group = g_S, display = display.none)
+lunSess  = input.session("1130-1300", "NY Lunch (builds NY PM's walls)", group = g_S, display = display.none)
+pmSess   = input.session("1330-1600", "NY PM (hunts Lunch's walls)", group = g_S, display = display.none)
+blockLen = input.int(30, "Shift block length (minutes)", minval = 5, tooltip = "Shift = two consecutive blocks printing HH+HL (bull) or LL+LH (bear) inside London / NY AM / NY PM. The final block is checked at the session close, so a 90-minute NY AM can only confirm at 11:00.", group = g_S, display = display.none)
+
+var g_W = "Session walls"
+showAsia = input.bool(true, "Asia high / low", inline = "a", group = g_W, display = display.none)
+colAsia  = input.color(color.purple, "", inline = "a", group = g_W, display = display.none)
+showLdn  = input.bool(true, "London high / low", inline = "l", group = g_W, display = display.none)
+colLdn   = input.color(color.red, "", inline = "l", group = g_W, display = display.none)
+showLun  = input.bool(true, "NY Lunch high / low", inline = "n", group = g_W, display = display.none)
+colLun   = input.color(#f9a825, "", inline = "n", group = g_W, display = display.none)
+showMid  = input.bool(false, "Show wall midpoints", group = g_W, display = display.none)
+avgLen   = input.int(20, "Compression: average length", minval = 2, group = g_W, display = display.none)
+compPct  = input.float(75.0, "Compressed if range < x % of its own average", step = 1.0, group = g_W, display = display.none)
+
+var g_H = "Day · Week · Month (exchange day, 18:00 ET start)"
+showPD     = input.bool(true, "PDH / PDL", inline = "pd", group = g_H, display = display.none)
+colPD      = input.color(color.blue, "", inline = "pd", group = g_H, display = display.none)
+showDays   = input.bool(true, "Each day's high / low this week", inline = "dw", group = g_H, display = display.none)
+colDOW     = input.color(#5b9cf6, "", inline = "dw", group = g_H, display = display.none)
+showToday  = input.bool(true, "Today's high / low so far", group = g_H, display = display.none)
+showWk     = input.bool(true, "Week high / low to date", inline = "wk", group = g_H, display = display.none)
+colWk      = input.color(#089981, "", inline = "wk", group = g_H, display = display.none)
+showMo     = input.bool(true, "Month high / low to date", inline = "mo", group = g_H, display = display.none)
+colMo      = input.color(#880e4f, "", inline = "mo", group = g_H, display = display.none)
+showPW     = input.bool(false, "Previous week high / low", inline = "pw", group = g_H, display = display.none)
+colPW      = input.color(#089981, "", inline = "pw", group = g_H, display = display.none)
+showPM     = input.bool(false, "Previous month high / low", inline = "pm", group = g_H, display = display.none)
+colPM      = input.color(#880e4f, "", inline = "pm", group = g_H, display = display.none)
+htfW       = input.int(1, "Line width", minval = 1, maxval = 4, group = g_H, display = display.none)
+showDowLbl = input.bool(true, "Day-of-week labels along the bottom", group = g_H, display = display.none)
+
+var g_E = "Sweeps & shifts"
+showSweep  = input.bool(true, "Mark session-wall sweeps (Asia / London / Lunch)", group = g_E, display = display.none)
+showPDsw   = input.bool(true, "Mark PDH / PDL sweeps", group = g_E, display = display.none)
+showDOWsw  = input.bool(false, "Mark sweeps of earlier days this week", group = g_E, display = display.none)
+showPrevSw = input.bool(true, "Mark previous week / month sweeps", group = g_E, display = display.none)
+showShift  = input.bool(true, "Mark shifts (with sweep context)", group = g_E, display = display.none)
+
+// Theme: Auto follows the chart background; colours left at their default (#000001) follow it
+bgLum  = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+isDark = themeI == "Dark" or (themeI == "Auto" and bgLum < 128)
+autoC(color c) => color.r(c) == 0 and color.g(c) == 0 and color.b(c) == 1
+fgAuto = isDark ? #d1d4dc : #131722
+txtCol = autoC(txtColI) ? fgAuto : txtColI
+
+
+if not timeframe.isintraday
+    runtime.error("Kekkai needs an intraday chart (1–5 min recommended).")
+
+tSize  = lblSize == "Tiny" ? size.tiny : lblSize == "Normal" ? size.normal : size.small
+sessOK = timeframe.in_seconds() <= 30 * 60   // session walls / shifts only on 30 min or lower
+
+// ── Types ───────────────────────────────────────────────
+type Lvl
+    line   ln
+    label  lb
+    float  y
+    bool   isHigh
+    string nm
+    color  col
+    bool   ev
+    bool   taken
+
+type Draw
+    line  l
+    label b
+
+// ── Session flags ───────────────────────────────────────
+inAsia = not na(time(timeframe.period, asiaSess, tz))
+inLdn  = not na(time(timeframe.period, ldnSess, tz))
+inNY   = not na(time(timeframe.period, nySess, tz))
+asiaStart = inAsia and not inAsia[1]
+asiaEnd   = not inAsia and inAsia[1]
+ldnStart  = inLdn and not inLdn[1]
+ldnEnd    = not inLdn and inLdn[1]
+nyStart   = inNY and not inNY[1]
+nyEnd     = not inNY and inNY[1]
+inLun  = not na(time(timeframe.period, lunSess, tz))
+inPM   = not na(time(timeframe.period, pmSess, tz))
+lunStart  = inLun and not inLun[1]
+lunEnd    = not inLun and inLun[1]
+pmStart   = inPM and not inPM[1]
+pmEnd     = not inPM and inPM[1]
+
+sessTag() => inAsia ? " · Asia" : inLdn ? " · London" : inNY ? " · NY AM" : inLun ? " · NY Lunch" : inPM ? " · NY PM" : ""
+
+// ── Session high / low trackers (with the time each extreme printed) ──
+var float aH = na
+var float aL = na
+var int aHt = na
+var int aLt = na
+var float lH = na
+var float lL = na
+var int lHt = na
+var int lLt = na
+if asiaStart
+    aH := high
+    aL := low
+    aHt := time
+    aLt := time
+else if inAsia
+    if high > aH
+        aH := high
+        aHt := time
+    if low < aL
+        aL := low
+        aLt := time
+if ldnStart
+    lH := high
+    lL := low
+    lHt := time
+    lLt := time
+else if inLdn
+    if high > lH
+        lH := high
+        lHt := time
+    if low < lL
+        lL := low
+        lLt := time
+var float uH = na
+var float uL = na
+var int uHt = na
+var int uLt = na
+if lunStart
+    uH := high
+    uL := low
+    uHt := time
+    uLt := time
+else if inLun
+    if high > uH
+        uH := high
+        uHt := time
+    if low < uL
+        uL := low
+        uLt := time
+
+// ── Compression: session range vs its own trailing average ──
+var array<float> asiaR = array.new<float>()
+var array<float> ldnR  = array.new<float>()
+var array<float> lunR  = array.new<float>()
+compressed(array<float> arr, float rng) =>
+    n = arr.size()
+    n >= avgLen ? rng < compPct / 100 * arr.slice(n - avgLen, n).avg() : false
+
+// ── Drawing store (tagged with trading day) ──────────────
+var int dayCount = 0
+if asiaStart
+    dayCount += 1
+
+var array<line>   wLine = array.new<line>()
+var array<label>  wLbl  = array.new<label>()
+var array<int>    wDay  = array.new<int>()
+var array<string> wType = array.new<string>()
+var array<bool>   wLive = array.new<bool>()
+var array<label>  evLbl = array.new<label>()
+var array<int>    evDay = array.new<int>()
+
+mkWall(int t0, float y, color col, string typ, string txt, string st) =>
+    wLine.push(line.new(t0, y, time, y, xloc = xloc.bar_time, color = col, style = st, width = 1))
+    wLbl.push(label.new(time, y, str.format_time(t0, dateFmt, tz) + " " + txt, xloc = xloc.bar_time, style = label.style_label_left, color = #ffffff00, textcolor = txtCol, size = tSize))
+    wDay.push(dayCount)
+    wType.push(typ)
+    wLive.push(true)
+
+mkEvent(float y, string txt, color col, bool above) =>
+    evLbl.push(label.new(time, y, txt, xloc = xloc.bar_time, style = above ? label.style_label_down : label.style_label_up, color = color.new(col, 80), textcolor = txtCol, size = tSize))
+    evDay.push(dayCount)
+
+retire(string typ) =>
+    if wType.size() > 0
+        for i = 0 to wType.size() - 1
+            if wType.get(i) == typ
+                wLive.set(i, false)
+
+// cleanup: drop session drawings older than N trading days
+if asiaStart
+    while wDay.size() > 0 and wDay.get(0) <= dayCount - maxDays
+        wLine.shift().delete()
+        wLbl.shift().delete()
+        wDay.shift()
+        wType.shift()
+        wLive.shift()
+    while evDay.size() > 0 and evDay.get(0) <= dayCount - maxDays
+        evLbl.shift().delete()
+        evDay.shift()
+
+// ── Session walls ───────────────────────────────────────
+var float asiaWH = na
+var float asiaWL = na
+var float ldnWH  = na
+var float ldnWL  = na
+var bool  asiaComp = false
+var bool  ldnComp  = false
+var float lunWH  = na
+var float lunWL  = na
+var bool  lunComp  = false
+
+if asiaEnd and not na(aH)
+    asiaComp := compressed(asiaR, aH - aL)
+    asiaR.push(aH - aL)
+    asiaWH := aH
+    asiaWL := aL
+    if showAsia and sessOK
+        tag = asiaComp ? " · compressed" : ""
+        mkWall(aHt, aH, colAsia, "Asia", "Asia H — London's wall" + tag, line.style_solid)
+        mkWall(aLt, aL, colAsia, "Asia", "Asia L — London's wall" + tag, line.style_solid)
+        if showMid
+            mkWall(math.min(aHt, aLt), (aH + aL) / 2, color.new(colAsia, 50), "Asia", "Asia mid", line.style_dotted)
+if ldnEnd and not na(lH)
+    ldnComp := compressed(ldnR, lH - lL)
+    ldnR.push(lH - lL)
+    ldnWH := lH
+    ldnWL := lL
+    if extMode != "To last candle"
+        retire("Asia")
+    if showLdn and sessOK
+        tag = ldnComp ? " · compressed" : ""
+        mkWall(lHt, lH, colLdn, "London", "London H — NY AM's wall" + tag, line.style_solid)
+        mkWall(lLt, lL, colLdn, "London", "London L — NY AM's wall" + tag, line.style_solid)
+        if showMid
+            mkWall(math.min(lHt, lLt), (lH + lL) / 2, color.new(colLdn, 50), "London", "London mid", line.style_dotted)
+if nyEnd and extMode != "To last candle"
+    retire("London")
+if lunEnd and not na(uH)
+    lunComp := compressed(lunR, uH - uL)
+    lunR.push(uH - uL)
+    lunWH := uH
+    lunWL := uL
+    if showLun and sessOK
+        tag = lunComp ? " · compressed" : ""
+        mkWall(uHt, uH, colLun, "Lunch", "Lunch H — NY PM's wall" + tag, line.style_solid)
+        mkWall(uLt, uL, colLun, "Lunch", "Lunch L — NY PM's wall" + tag, line.style_solid)
+        if showMid
+            mkWall(math.min(uHt, uLt), (uH + uL) / 2, color.new(colLun, 50), "Lunch", "Lunch mid", line.style_dotted)
+if pmEnd and extMode != "To last candle"
+    retire("Lunch")
+
+// ── Day / week / month data (completed exchange days only, no lookahead leak) ──
+dctx() =>
+    var float wh = na
+    var float wl = na
+    var int whk = na
+    var int wlk = na
+    var float mh = na
+    var float ml = na
+    var int mhk = na
+    var int mlk = na
+    var float pwh = na
+    var float pwl = na
+    var int pwhk = na
+    var int pwlk = na
+    var float pmh = na
+    var float pml = na
+    var int pmhk = na
+    var int pmlk = na
+    var int dIdx = 0
+    k   = time_tradingday
+    nw  = time("W") != time("W")[1]
+    nmo = time("M") != time("M")[1]
+    // state through yesterday = completed days of this week / month
+    cwh  = nw ? na : wh
+    cwl  = nw ? na : wl
+    cwhk = nw ? na : whk
+    cwlk = nw ? na : wlk
+    cmh  = nmo ? na : mh
+    cml  = nmo ? na : ml
+    cmhk = nmo ? na : mhk
+    cmlk = nmo ? na : mlk
+    if nw
+        pwh  := wh
+        pwl  := wl
+        pwhk := whk
+        pwlk := wlk
+        wh   := high
+        wl   := low
+        whk  := k
+        wlk  := k
+        dIdx := 0
+    else
+        if na(wh) or high > wh
+            wh  := high
+            whk := k
+        if na(wl) or low < wl
+            wl  := low
+            wlk := k
+        dIdx += 1
+    if nmo
+        pmh  := mh
+        pml  := ml
+        pmhk := mhk
+        pmlk := mlk
+        mh   := high
+        ml   := low
+        mhk  := k
+        mlk  := k
+    else
+        if na(mh) or high > mh
+            mh  := high
+            mhk := k
+        if na(ml) or low < ml
+            ml  := low
+            mlk := k
+    pdComp = (high[1] - low[1]) < compPct / 100 * ta.sma(high - low, avgLen)[2]
+    [cwh, cwl, cwhk, cwlk, cmh, cml, cmhk, cmlk, pwh, pwl, pwhk, pwlk, pmh, pml, pmhk, pmlk, dIdx, pdComp, high[1], low[1], time_tradingday[1], high[2], low[2], time_tradingday[2], high[3], low[3], time_tradingday[3], high[4], low[4], time_tradingday[4], high[5], low[5], time_tradingday[5]]
+
+[cwh, cwl, cwhk, cwlk, cmh, cml, cmhk, cmlk, pwh, pwl, pwhk, pwlk, pmh, pml, pmhk, pmlk, dIdx, pdComp, d1H, d1L, d1K, d2H, d2L, d2K, d3H, d3L, d3K, d4H, d4L, d4K, d5H, d5L, d5K] = request.security(syminfo.tickerid, "D", dctx(), lookahead = barmerge.lookahead_on)
+
+pickH(int k) => k == 1 ? d1H : k == 2 ? d2H : k == 3 ? d3H : k == 4 ? d4H : d5H
+pickL(int k) => k == 1 ? d1L : k == 2 ? d2L : k == 3 ? d3L : k == 4 ? d4L : d5L
+pickK(int k) => k == 1 ? d1K : k == 2 ? d2K : k == 3 ? d3K : k == 4 ? d4K : d5K
+
+dowName(int d) =>
+    switch d
+        dayofweek.monday    => "Mon"
+        dayofweek.tuesday   => "Tue"
+        dayofweek.wednesday => "Wed"
+        dayofweek.thursday  => "Thu"
+        dayofweek.friday    => "Fri"
+        dayofweek.saturday  => "Sat"
+        => "Sun"
+
+// ── Chart-side day tracking: exact candle each day's high / low printed ──
+newDay = timeframe.change("D")
+build  = newDay or barstate.isfirst
+tdKey  = time_tradingday
+
+var array<int>   cdKey = array.new<int>()
+var array<float> cdH   = array.new<float>()
+var array<float> cdL   = array.new<float>()
+var array<int>   cdHt  = array.new<int>()
+var array<int>   cdLt  = array.new<int>()
+var float dH = na
+var float dL = na
+var int dHt = na
+var int dLt = na
+if newDay or na(dH)
+    if newDay and not na(dH)
+        cdKey.push(time_tradingday[1])
+        cdH.push(dH)
+        cdL.push(dL)
+        cdHt.push(dHt)
+        cdLt.push(dLt)
+        if cdKey.size() > 40
+            cdKey.shift()
+            cdH.shift()
+            cdL.shift()
+            cdHt.shift()
+            cdLt.shift()
+    dH := high
+    dL := low
+    dHt := time
+    dLt := time
+else
+    if high > dH
+        dH := high
+        dHt := time
+    if low < dL
+        dL := low
+        dLt := time
+
+// exact candle time if that day is on the chart, otherwise the start of that day
+anchorT(int key, float y, bool isHigh) =>
+    int t = key
+    if not na(key)
+        idx = cdKey.indexof(key)
+        if idx >= 0
+            if isHigh and cdH.get(idx) == y
+                t := cdHt.get(idx)
+            else if not isHigh and cdL.get(idx) == y
+                t := cdLt.get(idx)
+    t
+
+lvTxt(int key, int t, string nm) =>
+    (t != key ? str.format_time(t, "HH:mm", tz) + " " : "") + str.format_time(key, "MM/dd", "UTC") + " " + nm
+
+// ── Fixed levels: PDH/PDL, each completed day this week, previous week / month ──
+var array<Lvl> dayLv = array.new<Lvl>()
+var array<Lvl> pwLv  = array.new<Lvl>()
+var array<Lvl> pmLv  = array.new<Lvl>()
+
+clearLvls(array<Lvl> arr) =>
+    while arr.size() > 0
+        lv = arr.pop()
+        lv.ln.delete()
+        lv.lb.delete()
+
+newLvl(int t0, float y, bool isHigh, string nm, string txt, color col, bool ev, bool taken) =>
+    ln = line.new(t0, y, time, y, xloc = xloc.bar_time, color = col, style = taken ? line.style_dashed : line.style_solid, width = htfW)
+    lb = label.new(time, y, txt, xloc = xloc.bar_time, style = label.style_label_left, color = #ffffff00, textcolor = txtCol, size = tSize)
+    Lvl.new(ln, lb, y, isHigh, nm, col, ev, taken)
+
+if build
+    clearLvls(dayLv)
+    if showPD or showDays
+        nDone = math.min(nz(dIdx), 5)
+        kTop  = math.max(nDone, 1)
+        for k = kTop to 1
+            hk = pickH(k)
+            lk = pickL(k)
+            kk = pickK(k)
+            isPD  = k == 1 and showPD
+            plain = showDays and k <= nDone
+            if not na(hk) and not na(kk) and (isPD or plain)
+                // already taken by a later completed day this week?
+                float mH = na
+                float mL = na
+                if k > 1
+                    for j = 1 to k - 1
+                        pj = pickH(j)
+                        qj = pickL(j)
+                        mH := na(mH) ? pj : math.max(mH, pj)
+                        mL := na(mL) ? qj : math.min(mL, qj)
+                tH   = anchorT(kk, hk, true)
+                tL   = anchorT(kk, lk, false)
+                dn   = dowName(dayofweek(kk, "UTC"))
+                c    = isPD ? colPD : colDOW
+                nmH  = isPD ? "PDH" : dn + " H"
+                nmL  = isPD ? "PDL" : dn + " L"
+                tail = isPD ? " · " + dn + (pdComp ? " · compressed day" : "") : ""
+                ev   = isPD ? showPDsw : showDOWsw
+                dayLv.push(newLvl(tH, hk, true, nmH, lvTxt(kk, tH, nmH) + tail, c, ev, not na(mH) and mH > hk))
+                dayLv.push(newLvl(tL, lk, false, nmL, lvTxt(kk, tL, nmL) + tail, c, ev, not na(mL) and mL < lk))
+    clearLvls(pwLv)
+    if showPW and not na(pwh)
+        tH = anchorT(pwhk, pwh, true)
+        tL = anchorT(pwlk, pwl, false)
+        pwLv.push(newLvl(tH, pwh, true, "PWH", lvTxt(pwhk, tH, "PWH"), colPW, showPrevSw, not na(cwh) and cwh > pwh))
+        pwLv.push(newLvl(tL, pwl, false, "PWL", lvTxt(pwlk, tL, "PWL"), colPW, showPrevSw, not na(cwl) and cwl < pwl))
+    clearLvls(pmLv)
+    if showPM and not na(pmh)
+        tH = anchorT(pmhk, pmh, true)
+        tL = anchorT(pmlk, pml, false)
+        pmLv.push(newLvl(tH, pmh, true, "PMH", lvTxt(pmhk, tH, "PMH"), colPM, showPrevSw, not na(cmh) and cmh > pmh))
+        pmLv.push(newLvl(tL, pml, false, "PML", lvTxt(pmlk, tL, "PML"), colPM, showPrevSw, not na(cml) and cml < pml))
+
+// every bar: grow to the current candle; dash and mark when taken
+tend(array<Lvl> arr) =>
+    n = arr.size()
+    if n > 0
+        for i = 0 to n - 1
+            lv = arr.get(i)
+            lv.ln.set_x2(time)
+            lv.lb.set_x(time)
+            if not lv.taken and (lv.isHigh ? high > lv.y : low < lv.y)
+                lv.taken := true
+                lv.ln.set_style(line.style_dashed)
+                if lv.ev
+                    mkEvent(lv.isHigh ? high : low, lv.nm + " swept " + str.format_time(time, "HH:mm", tz) + sessTag(), lv.col, lv.isHigh)
+
+tend(dayLv)
+tend(pwLv)
+tend(pmLv)
+
+// PDH / PDL taken today (context for shift labels)
+var bool pdTkH = false
+var bool pdTkL = false
+if build
+    pdTkH := false
+    pdTkL := false
+if not na(d1H) and high > d1H
+    pdTkH := true
+if not na(d1L) and low < d1L
+    pdTkL := true
+pdCtx() => pdTkH and pdTkL ? " · PDH+PDL taken" : pdTkH ? " · PDH taken" : pdTkL ? " · PDL taken" : ""
+
+// ── Shift detector: two consecutive blocks HH+HL / LL+LH ──
+// the final block is closed and checked on the first bar after the session
+detectShift(bool inS, bool sStart, bool sEnd, int blk) =>
+    var array<float> hh = array.new<float>()
+    var array<float> ll = array.new<float>()
+    var int curK = 0
+    var float cH = na
+    var float cL = na
+    var bool done = false
+    var int t0 = na
+    int res = 0
+    if sStart
+        hh.clear()
+        ll.clear()
+        curK := 0
+        cH := high
+        cL := low
+        done := false
+        t0 := time
+    else if (inS or sEnd) and not na(t0)
+        k = int((time - t0) / (blk * 60000))
+        if k != curK or sEnd
+            hh.push(cH)
+            ll.push(cL)
+            n = hh.size()
+            if n >= 3 and not done
+                h0 = hh.get(n - 3)
+                l0 = ll.get(n - 3)
+                h1 = hh.get(n - 2)
+                l1 = ll.get(n - 2)
+                h2 = hh.get(n - 1)
+                l2 = ll.get(n - 1)
+                if h1 > h0 and l1 > l0 and h2 > h1 and l2 > l1
+                    res := 1
+                    done := true
+                else if l1 < l0 and h1 < h0 and l2 < l1 and h2 < h1
+                    res := -1
+                    done := true
+            curK := k
+            cH := high
+            cL := low
+        else
+            cH := math.max(cH, high)
+            cL := math.min(cL, low)
+    res
+
+ldnShift = detectShift(inLdn, ldnStart, ldnEnd, blockLen)
+nyShift  = detectShift(inNY, nyStart, nyEnd, blockLen)
+pmShift  = detectShift(inPM, pmStart, pmEnd, blockLen)
+
+// ── Session-wall sweeps (only inside the hunting session) ──
+var bool lSwH = false
+var bool lSwL = false
+var bool nSwH = false
+var bool nSwL = false
+var bool pSwH = false
+var bool pSwL = false
+if ldnStart
+    lSwH := false
+    lSwL := false
+if nyStart
+    nSwH := false
+    nSwL := false
+if pmStart
+    pSwH := false
+    pSwL := false
+
+sweepMark(float y, string txt, color col, bool above) =>
+    if showSweep and sessOK
+        mkEvent(y, txt + " " + str.format_time(time, "HH:mm", tz), col, above)
+
+if inLdn and not na(asiaWH)
+    if not lSwH and high > asiaWH
+        lSwH := true
+        sweepMark(high, "Asia H swept", colAsia, true)
+    if not lSwL and low < asiaWL
+        lSwL := true
+        sweepMark(low, "Asia L swept", colAsia, false)
+if inNY and not na(ldnWH)
+    if not nSwH and high > ldnWH
+        nSwH := true
+        sweepMark(high, "London H swept", colLdn, true)
+    if not nSwL and low < ldnWL
+        nSwL := true
+        sweepMark(low, "London L swept", colLdn, false)
+if inPM and not na(lunWH)
+    if not pSwH and high > lunWH
+        pSwH := true
+        sweepMark(high, "Lunch H swept", colLun, true)
+    if not pSwL and low < lunWL
+        pSwL := true
+        sweepMark(low, "Lunch L swept", colLun, false)
+
+classify(int dir, bool swH, bool swL) =>
+    swH and swL ? "both walls hunted" : (swH and dir < 0) or (swL and dir > 0) ? "REVERSAL (" + (swH ? "high" : "low") + " hunted)" : swH or swL ? "continuation" : "no sweep"
+
+if ldnShift != 0 and showShift and sessOK
+    cls = classify(ldnShift, lSwH, lSwL) + pdCtx()
+    mkEvent(ldnShift > 0 ? low : high, (ldnShift > 0 ? "▲" : "▼") + " London shift · " + cls, ldnShift > 0 ? color.green : color.red, ldnShift < 0)
+if nyShift != 0 and showShift and sessOK
+    cls = classify(nyShift, nSwH, nSwL) + pdCtx()
+    mkEvent(nyShift > 0 ? low : high, (nyShift > 0 ? "▲" : "▼") + " NY AM shift · " + cls, nyShift > 0 ? color.green : color.red, nyShift < 0)
+if pmShift != 0 and showShift and sessOK
+    cls = classify(pmShift, pSwH, pSwL) + pdCtx()
+    mkEvent(pmShift > 0 ? low : high, (pmShift > 0 ? "▲" : "▼") + " NY PM shift · " + cls, pmShift > 0 ? color.green : color.red, pmShift < 0)
+
+// ── Every bar: grow live session walls; colour by age; dash hunted walls ──
+nW = wLine.size()
+if nW > 0
+    for i = 0 to nW - 1
+        if wLive.get(i)
+            wLine.get(i).set_x2(time)
+            wLbl.get(i).set_x(time)
+        if dayCount - wDay.get(i) >= ageDays
+            wLine.get(i).set_color(agedCol)
+            wLbl.get(i).set_textcolor(color.gray)
+        if wDay.get(i) == dayCount
+            y = wLine.get(i).get_y1()
+            typ = wType.get(i)
+            hunted = (typ == "Asia" and ((lSwH and y == asiaWH) or (lSwL and y == asiaWL))) or (typ == "London" and ((nSwH and y == ldnWH) or (nSwL and y == ldnWL))) or (typ == "Lunch" and ((pSwH and y == lunWH) or (pSwL and y == lunWL)))
+            if hunted
+                wLine.get(i).set_style(line.style_dashed)
+nE = evLbl.size()
+if nE > 0
+    for i = 0 to nE - 1
+        if dayCount - evDay.get(i) >= ageDays
+            evLbl.get(i).set_color(color.new(agedCol, 85))
+            evLbl.get(i).set_textcolor(color.gray)
+
+// ── Developing levels: today, week to date, month to date ──
+var Draw tdHd = Draw.new()
+var Draw tdLd = Draw.new()
+var Draw wkHd = Draw.new()
+var Draw wkLd = Draw.new()
+var Draw moHd = Draw.new()
+var Draw moLd = Draw.new()
+
+upsert(Draw d, int t, float y, string txt, color col) =>
+    if na(d.l)
+        d.l := line.new(t, y, time, y, xloc = xloc.bar_time, color = col, style = line.style_dotted, width = htfW)
+        d.b := label.new(time, y, txt, xloc = xloc.bar_time, style = label.style_label_left, color = #ffffff00, textcolor = txtCol, size = tSize)
+    d.l.set_xy1(t, y)
+    d.l.set_xy2(time, y)
+    d.b.set_xy(time, y)
+    d.b.set_text(txt)
+
+if barstate.islast and not na(dH)
+    if showToday
+        dn = dowName(dayofweek(tdKey, "UTC"))
+        upsert(tdHd, dHt, dH, lvTxt(tdKey, dHt, dn + " H (so far)"), colDOW)
+        upsert(tdLd, dLt, dL, lvTxt(tdKey, dLt, dn + " L (so far)"), colDOW)
+    if showWk
+        useH = na(cwh) or dH > cwh
+        useL = na(cwl) or dL < cwl
+        wHy = useH ? dH : cwh
+        wHk = useH ? tdKey : cwhk
+        wHt = useH ? dHt : anchorT(cwhk, cwh, true)
+        wLy = useL ? dL : cwl
+        wLk = useL ? tdKey : cwlk
+        wLt = useL ? dLt : anchorT(cwlk, cwl, false)
+        upsert(wkHd, wHt, wHy, lvTxt(wHk, wHt, "Week H (to date)"), colWk)
+        upsert(wkLd, wLt, wLy, lvTxt(wLk, wLt, "Week L (to date)"), colWk)
+    if showMo
+        useH = na(cmh) or dH > cmh
+        useL = na(cml) or dL < cml
+        mHy = useH ? dH : cmh
+        mHk = useH ? tdKey : cmhk
+        mHt = useH ? dHt : anchorT(cmhk, cmh, true)
+        mLy = useL ? dL : cml
+        mLk = useL ? tdKey : cmlk
+        mLt = useL ? dLt : anchorT(cmlk, cml, false)
+        upsert(moHd, mHt, mHy, lvTxt(mHk, mHt, "Month H (to date)"), colMo)
+        upsert(moLd, mLt, mLy, lvTxt(mLk, mLt, "Month L (to date)"), colMo)
+
+// ── Day-of-week labels along the bottom ──
+tdDow = dayofweek(tdKey, "UTC")
+dl = showDowLbl and newDay
+plotchar(dl and tdDow == dayofweek.monday, "Monday", "", location.bottom, text = "MONDAY", textcolor = txtCol, editable = false)
+plotchar(dl and tdDow == dayofweek.tuesday, "Tuesday", "", location.bottom, text = "TUESDAY", textcolor = txtCol, editable = false)
+plotchar(dl and tdDow == dayofweek.wednesday, "Wednesday", "", location.bottom, text = "WEDNESDAY", textcolor = txtCol, editable = false)
+plotchar(dl and tdDow == dayofweek.thursday, "Thursday", "", location.bottom, text = "THURSDAY", textcolor = txtCol, editable = false)
+plotchar(dl and tdDow == dayofweek.friday, "Friday", "", location.bottom, text = "FRIDAY", textcolor = txtCol, editable = false)
